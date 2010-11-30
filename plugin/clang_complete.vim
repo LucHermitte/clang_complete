@@ -58,7 +58,23 @@
 " Todo: - Fix bugs
 "       - Parse fix-its and do something useful with it.
 "       - -code-completion-macros -code-completion-patterns
+"	- (LH) move code to autoload plugins for a smaller footprint
+"	- (LH) no b: variables in a plugin. ftplugins yes, plugins Never!
 "
+" LH fixes:
+" - automated PCH files for each file (tested with C++ source files)
+"   todo: support parallel hierarchy were to put those files
+
+
+let s:data = {
+	    \ 'variable': 'clang_auto_pch',
+	    \ 'texts': [ 'no', 'yes'],
+	    \ 'values': [ 0, 1],
+	    \ 'idx_crt_value': '1',
+	    \ 'menu': { 'priority': '500.100.10', 'name': '&Plugin.&CLang.Auto &PCH'}
+	    \ }
+silent! call lh#menu#def_toggle_item(s:data)
+
 
 au FileType c,cpp,objc,objcpp call s:ClangCompleteInit()
 
@@ -67,7 +83,7 @@ let b:clang_user_options = ''
 let b:my_changedtick = 0
 let b:clang_type_complete = 0
 
-function s:ClangCompleteInit()
+function! s:ClangCompleteInit()
     let l:local_conf = findfile('.clang_complete', '.;')
     let b:clang_user_options = ''
     if l:local_conf != ''
@@ -119,6 +135,10 @@ function s:ClangCompleteInit()
         let g:clang_user_options = ''
     endif
 
+    if !exists('g:clang_auto_pch')
+	let g:clang_auto_pch = 0
+    endif
+
     if g:clang_complete_auto == 1
         inoremap <expr> <buffer> <C-X><C-U> LaunchCompletion()
         inoremap <expr> <buffer> . CompleteDot()
@@ -167,7 +187,7 @@ function s:ClangCompleteInit()
     endif
 endfunction
 
-function s:GetKind(proto)
+function! s:GetKind(proto)
     if a:proto == ''
         return 't'
     endif
@@ -185,7 +205,7 @@ function s:GetKind(proto)
     return 'm'
 endfunction
 
-function s:DoPeriodicQuickFix()
+function! s:DoPeriodicQuickFix()
     " Don't do any superfluous reparsing.
     if b:my_changedtick == b:changedtick
         return
@@ -211,7 +231,7 @@ function s:DoPeriodicQuickFix()
     call s:ClangQuickFix(l:clang_output, l:tempfile)
 endfunction
 
-function s:ClangQuickFix(clang_output, tempfname)
+function! s:ClangQuickFix(clang_output, tempfname)
     " Clear the bad spell, the user may have corrected them.
     syntax clear SpellBad
     syntax clear SpellLocal
@@ -290,7 +310,7 @@ function s:ClangQuickFix(clang_output, tempfname)
     endif
 endfunction
 
-function s:DemangleProto(prototype)
+function! s:DemangleProto(prototype)
     let l:proto = substitute(a:prototype, '[#', '', 'g')
     let l:proto = substitute(l:proto, '#]', ' ', 'g')
     let l:proto = substitute(l:proto, '#>', '', 'g')
@@ -302,8 +322,41 @@ function s:DemangleProto(prototype)
     return l:proto
 endfunction
 
+function! s:UpdateIncludes(includes)
+    let inc_pch_file = expand('%:p:h').'/.inc-'.expand('%:t')
+    if !filereadable(inc_pch_file) || !filereadable(inc_pch_file.'.pch')
+	let res = s:DoUpdateIncludesPCH(a:includes, inc_pch_file)
+    else
+	let old_inc = readfile(inc_pch_file)
+	if old_inc != a:includes
+	    let res = s:DoUpdateIncludesPCH(a:includes, inc_pch_file)
+	else
+	    let res = inc_pch_file
+	endif
+    endif
+    return res
+endfunction
+
+function! s:DoUpdateIncludesPCH(includes, inc_pch_file)
+    call writefile(a:includes, a:inc_pch_file)
+    let command = g:clang_exec . ' -cc1 -fsyntax-only '
+		\ . b:clang_parameters . ' ' . b:clang_user_options
+		\ . ' ' . shellescape(a:inc_pch_file) . ' -emit-pch -o ' . shellescape(a:inc_pch_file.'.pch')
+    if &verbose > 0
+	echomsg command
+    endif
+    let clang_output = split(system(command), "\n")
+
+    call s:ClangQuickFix(l:clang_output, a:inc_pch_file)
+    if v:shell_error
+	return ''
+    endif
+    return a:inc_pch_file
+endfunction
+
 let b:col = 0
-function ClangComplete(findstart, base)
+function! ClangComplete(findstart, base)
+    " echomsg a:findstart . " - " . a:base
     if a:findstart
         let l:line = getline('.')
         let l:start = col('.') - 1
@@ -331,6 +384,22 @@ function ClangComplete(findstart, base)
         return l:start
     else
         let l:buf = getline(1, '$')
+	let line_idx = line('.')
+	if g:clang_auto_pch == 1
+	    let includes_idx = lh#list#matches(l:buf, '#include')
+	    let includes = lh#list#at(l:buf, includes_idx)
+	    let inc_pch_file = s:UpdateIncludes(includes)
+	    if empty(inc_pch_file)
+		return {}
+	    endif
+	    let l:buf[includes_idx[0]] = '#include "'.inc_pch_file.'"'
+	    call lh#list#remove(l:buf, includes_idx[1:])
+	    let line_idx -= len(includes_idx) - 1
+	    let pch_option = ' -include-pch ' . shellescape(inc_pch_file.'.pch')
+	else
+	    let pch_option = ''
+	endif
+
         let l:tempfile = expand('%:p:h') . '/' . localtime() . expand('%:t')
         try
             call writefile(l:buf, l:tempfile)
@@ -339,13 +408,17 @@ function ClangComplete(findstart, base)
         endtry
         let l:escaped_tempfile = shellescape(l:tempfile)
 
-        let l:command = g:clang_exec . ' -cc1 -fsyntax-only'
-                    \ . ' -fno-caret-diagnostics -fdiagnostics-print-source-range-info'
-                    \ . ' -code-completion-at=' . l:escaped_tempfile . ':'
-                    \ . line('.') . ':' . b:col . ' ' . l:escaped_tempfile
-                    \ . ' ' . b:clang_parameters . ' ' . b:clang_user_options . ' ' . g:clang_user_options
-        let l:clang_output = split(system(l:command), "\n")
-        call delete(l:tempfile)
+	let l:command = g:clang_exec . ' -cc1 -fsyntax-only'
+		    \ . pch_option
+		    \ . ' -fno-caret-diagnostics -fdiagnostics-print-source-range-info'
+		    \ . ' -code-completion-at=' . l:escaped_tempfile . ':'
+		    \ . line_idx . ':' . b:col . ' ' . l:escaped_tempfile
+		    \ . ' ' . b:clang_parameters . ' ' . b:clang_user_options . ' ' . g:clang_user_options
+	if 1 || &verbose > 0
+	    echomsg command
+	endif
+	let l:clang_output = split(system(l:command), "\n")
+	call delete(l:tempfile)
 
         call s:ClangQuickFix(l:clang_output, l:tempfile)
         if v:shell_error
@@ -436,15 +509,15 @@ function ClangComplete(findstart, base)
     endif
 endfunction
 
-function ShouldComplete()
+function! ShouldComplete()
     if (getline('.') =~ '#\s*\(include\|import\)')
         return 0
     else
         return match(synIDattr(synID(line('.'), col('.') - 1, 1), 'name'),
-                    \'\C\<cComment\|\<cCppString\|\<cString\|\<cNumber') == -1
+		    \'\C\<cComment\|\<cCppString\|\<cString\|\<cNumber') == -1
 endfunction
 
-function LaunchCompletion()
+function! LaunchCompletion()
     if ShouldComplete()
         return "\<C-X>\<C-U>"
     else
@@ -452,25 +525,25 @@ function LaunchCompletion()
     endif
 endfunction
 
-function CompleteDot()
+function! CompleteDot()
     return '.' . LaunchCompletion()
 endfunction
 
-function CompleteArrow()
+function! CompleteArrow()
     if getline('.')[col('.') - 2] != '-'
         return '>'
     endif
     return '>' . LaunchCompletion()
 endfunction
 
-function CompleteColon()
+function! CompleteColon()
     if getline('.')[col('.') - 2] != ':'
         return ':'
     endif
     return ':' . LaunchCompletion()
 endfunction
 
-function UpdateSnips()
+function! UpdateSnips()
     let l:line = getline('.')
     let l:pattern = '<#[^#]*#>'
     if match(l:line, l:pattern) == -1
@@ -481,7 +554,7 @@ function UpdateSnips()
     return "\<esc>/<#\<CR>v/#>\<CR>l\<C-G>"
 endfunction
 
-function BeginSnips()
+function! BeginSnips()
     if pumvisible() != 0
         return ''
     endif
@@ -500,7 +573,9 @@ function BeginSnips()
 endfunction
 
 " May be used in a mapping to update the quickfix window.
-function g:ClangUpdateQuickFix()
+function! g:ClangUpdateQuickFix()
     call s:DoPeriodicQuickFix()
     return ''
 endfunction
+
+" vim:set sw=4:
